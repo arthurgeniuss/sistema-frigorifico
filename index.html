@@ -6,6 +6,7 @@
 <title>Frigorífico Rodrigues</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <style>
   body { -webkit-tap-highlight-color: transparent; }
   .btn { min-height: 56px; font-weight: 800; border-radius: 14px; padding: 12px 16px; font-size: 1.15rem; transition: transform .05s; }
@@ -68,6 +69,29 @@ function toast(msg, ok = true) {
   toast._t = setTimeout(() => t.classList.add('hidden'), 3500);
 }
 function telDigits(t) { return String(t || '').replace(/\D/g, ''); }
+// Nome para exibir: família se tiver, senão o cliente (um dos dois é obrigatório)
+const nomeF = (f) => f.nome_familia || f.cliente_principal || 'Sem nome';
+const nomeCli = (f) => f.cliente_principal || f.nome_familia || '';
+let ocupado = false;
+async function seguro(fn) {            // impede clique duplo e mostra erros
+  if (ocupado) return;
+  ocupado = true;
+  try { await fn(); } catch (e) { toast('Erro: ' + (e.message || e), false); }
+  finally { ocupado = false; }
+}
+// O Supabase devolve no máximo 1000 linhas por busca: busca em páginas para nunca cortar dados
+async function tudo(tabela, selecao, filtro) {
+  let out = [], de = 0;
+  for (;;) {
+    let q = db.from(tabela).select(selecao).order('id').range(de, de + 999);
+    if (filtro) q = filtro(q);
+    const { data, error } = await q;
+    if (error) throw error;
+    out = out.concat(data);
+    if (data.length < 1000) return out;
+    de += 1000;
+  }
+}
 function waLink(tel, msg) {
   let d = telDigits(tel);
   if (!d) return null;
@@ -82,14 +106,17 @@ let canalTV = null;
 let timerTV = null;
 
 async function carregarFamilias() {
-  const { data: fams, error: e1 } = await db.from('familias').select('*, membros_familia(*)').order('nome_familia');
-  if (e1) throw e1;
-  const { data: fichas, error: e2 } = await db.from('fichas_compras').select('*').eq('status', 'Pendente').order('data_hora');
-  if (e2) throw e2;
+  const [fams, fichas] = await Promise.all([
+    tudo('familias', '*, membros_familia(*)'),
+    tudo('fichas_compras', '*', q => q.eq('status', 'Pendente'))
+  ]);
+  const porFamilia = new Map();
+  fichas.forEach(x => { const k = Number(x.familia_id); if (!porFamilia.has(k)) porFamilia.set(k, []); porFamilia.get(k).push(x); });
   familias = fams.map(f => {
-    const pend = fichas.filter(x => x.familia_id === f.id);
-    return { ...f, membros: f.membros_familia || [], fichas: pend, total: pend.reduce((s, x) => s + Number(x.valor_compra), 0) };
-  });
+    const pend = (porFamilia.get(Number(f.id)) || []).sort((a, b) => new Date(a.data_hora) - new Date(b.data_hora));
+    return { ...f, membros: f.membros_familia || [], fichas: pend,
+      total: Math.round(pend.reduce((s, x) => s + Number(x.valor_compra), 0) * 100) / 100 };
+  }).sort((a, b) => norm(nomeF(a)).localeCompare(norm(nomeF(b))));
 }
 
 // ---------- Login ----------
@@ -169,6 +196,10 @@ function renderInicio() {
       <button class="btn bg-green-600 text-white" onclick="modalNovaFamilia()">➕ Nova Família / Cliente</button>
       <button class="btn bg-blue-700 text-white" onclick="modalNovoPedido()">🛒 Novo Pedido Balcão</button>
     </div>
+    <div class="grid grid-cols-2 gap-2 mt-2">
+      <button class="btn bg-slate-800 text-white" onclick="modalFinalizar()">🔒 Finalizar Expediente</button>
+      <button class="btn bg-white border-2 border-slate-400 text-slate-800" onclick="seguro(modalDestinatarios)">📬 Destinatários</button>
+    </div>
   </header>
   <main id="lista" class="px-3 pb-24 max-w-5xl mx-auto grid gap-3 md:grid-cols-2"></main>`;
   $('#busca').addEventListener('input', (e) => { busca = e.target.value; renderLista(); });
@@ -185,8 +216,8 @@ function renderLista() {
 function cardFamilia(f) {
   const membros = f.membros.map(m => esc(m.nome_membro)).join(', ');
   return `<article class="bg-white rounded-2xl shadow-lg border-2 ${f.total > 0 ? 'border-red-400' : 'border-green-400'} p-4">
-    <h2 class="text-3xl font-black leading-tight">${esc(f.nome_familia)}</h2>
-    <p class="text-xl text-slate-700">👤 ${esc(f.cliente_principal)}</p>
+    <h2 class="text-3xl font-black leading-tight">${esc(nomeF(f))}</h2>
+    ${f.cliente_principal && f.nome_familia ? `<p class="text-xl text-slate-700">👤 ${esc(f.cliente_principal)}</p>` : ''}
     ${f.telefone_whatsapp ? `<p class="text-xl text-slate-700">📞 ${esc(f.telefone_whatsapp)}</p>` : ''}
     ${membros ? `<p class="text-lg text-slate-500">👨‍👩‍👧 ${membros}</p>` : ''}
     ${f.pedido_habitual ? `<p class="text-lg bg-amber-50 border border-amber-300 rounded-lg p-2 mt-2">⭐ <b>Habitual:</b> ${esc(f.pedido_habitual)}</p>` : ''}
@@ -218,18 +249,19 @@ const getF = (id) => familias.find(f => f.id === id);
 
 function modalNovaFamilia() {
   abrirModal(`${cabModal('➕ Nova Família / Cliente')}
-    <label class="${lbl}">Nome da família *</label><input id="nf_nome" class="${inp}" placeholder="Ex: Família Silva">
-    <label class="${lbl}">Responsável *</label><input id="nf_resp" class="${inp}" placeholder="Ex: João Silva">
+    <label class="${lbl}">Nome do cliente</label><input id="nf_resp" class="${inp}" placeholder="Ex: João Silva">
+    <label class="${lbl}">Nome da família (se tiver)</label><input id="nf_nome" class="${inp}" placeholder="Ex: Família Silva">
+    <p class="text-base text-slate-500 mt-1">Preencha pelo menos um dos dois.</p>
     <label class="${lbl}">WhatsApp (com DDD)</label><input id="nf_tel" type="tel" inputmode="tel" class="${inp}" placeholder="(75) 99999-9999">
     <label class="${lbl}">Pedido habitual</label><textarea id="nf_hab" rows="2" class="${inp}" placeholder="Ex: 1kg de acém moído + 500g de linguiça"></textarea>
     <label class="${lbl}">Outros membros (um por linha)</label><textarea id="nf_mem" rows="3" class="${inp}" placeholder="Pedro Silva (Filho)&#10;Maria Silva (Esposa)"></textarea>
-    <button class="btn bg-green-600 text-white w-full mt-4 text-2xl" onclick="salvarFamilia()">✅ SALVAR</button>`);
+    <button class="btn bg-green-600 text-white w-full mt-4 text-2xl" onclick="seguro(salvarFamilia)">✅ SALVAR</button>`);
 }
 async function salvarFamilia() {
   const nome = $('#nf_nome').value.trim(), resp = $('#nf_resp').value.trim();
-  if (!nome || !resp) return toast('Preencha o nome da família e o responsável', false);
+  if (!nome && !resp) return toast('Preencha o nome do cliente ou da família', false);
   const { data, error } = await db.from('familias').insert({
-    nome_familia: nome, cliente_principal: resp,
+    nome_familia: nome || null, cliente_principal: resp || null,
     telefone_whatsapp: $('#nf_tel').value.trim() || null, pedido_habitual: $('#nf_hab').value.trim() || null
   }).select().single();
   if (error) return toast('Erro: ' + error.message, false);
@@ -241,20 +273,19 @@ async function salvarFamilia() {
 function modalCompra(id) {
   const f = getF(id);
   abrirModal(`${cabModal('🧾 Registrar Compra (Fiado)')}
-    <p class="text-xl font-bold text-red-700">${esc(f.nome_familia)}</p>
-    <label class="${lbl}">O que levou? *</label>
+    <p class="text-xl font-bold text-red-700">${esc(nomeF(f))}</p>
+    <label class="${lbl}">O que levou? (se quiser anotar)</label>
     <textarea id="rc_desc" rows="3" class="${inp}" placeholder="Ex: 2kg de acém, 1kg de linguiça"></textarea>
     ${f.pedido_habitual ? `<button class="btn bg-amber-100 border-2 border-amber-400 w-full mt-2 text-lg" onclick="$('#rc_desc').value=getF(${id}).pedido_habitual">⭐ Usar pedido habitual</button>` : ''}
     <label class="${lbl}">Valor (R$) *</label>
     <input id="rc_val" inputmode="decimal" class="${inp} text-3xl font-black" placeholder="0,00">
-    <button class="btn bg-orange-500 text-white w-full mt-4 text-2xl" onclick="salvarCompra(${id})">✅ SALVAR COMPRA</button>`);
+    <button class="btn bg-orange-500 text-white w-full mt-4 text-2xl" onclick="seguro(()=>salvarCompra(${id}))">✅ SALVAR COMPRA</button>`);
   setTimeout(() => $('#rc_desc').focus(), 100);
 }
 async function salvarCompra(id) {
   const desc = $('#rc_desc').value.trim(), val = parseValor($('#rc_val').value);
-  if (!desc) return toast('Escreva o que o cliente levou', false);
   if (isNaN(val) || val <= 0) return toast('Digite um valor válido', false);
-  const { error } = await db.from('fichas_compras').insert({ familia_id: id, descricao_itens: desc, valor_compra: val, status: 'Pendente' });
+  const { error } = await db.from('fichas_compras').insert({ familia_id: id, descricao_itens: desc || null, valor_compra: val, status: 'Pendente' });
   if (error) return toast('Erro: ' + error.message, false);
   fecharModal(); toast('Compra anotada na ficha!'); render();
 }
@@ -263,7 +294,7 @@ function modalPagamento(id) {
   const f = getF(id);
   if (f.total <= 0) return toast('Esta família não tem dívida 🎉');
   abrirModal(`${cabModal('💵 Registrar Pagamento')}
-    <p class="text-xl font-bold">${esc(f.nome_familia)}</p>
+    <p class="text-xl font-bold">${esc(nomeF(f))}</p>
     <div class="bg-red-100 rounded-xl p-3 text-center mt-2"><div class="font-bold">Deve</div><div class="text-4xl font-black text-red-700">${brl(f.total)}</div></div>
     <label class="${lbl}">Valor pago (R$) *</label>
     <input id="pg_val" inputmode="decimal" class="${inp} text-3xl font-black" value="${f.total.toFixed(2).replace('.', ',')}">
@@ -272,7 +303,7 @@ function modalPagamento(id) {
     <div class="grid grid-cols-3 gap-2" id="pg_forma">
       ${['Dinheiro', 'Pix', 'Cartão'].map((x, i) => `<button type="button" data-v="${x}" class="btn border-4 ${i === 0 ? 'border-green-600 bg-green-100' : 'border-slate-300 bg-white'}" onclick="escolherForma(this)">${x === 'Dinheiro' ? '💵' : x === 'Pix' ? '📱' : '💳'}<br>${x}</button>`).join('')}
     </div>
-    <button class="btn bg-green-600 text-white w-full mt-4 text-2xl" onclick="salvarPagamento(${id})">✅ CONFIRMAR PAGAMENTO</button>`);
+    <button class="btn bg-green-600 text-white w-full mt-4 text-2xl" onclick="seguro(()=>salvarPagamento(${id}))">✅ CONFIRMAR PAGAMENTO</button>`);
 }
 function escolherForma(btn) {
   document.querySelectorAll('#pg_forma button').forEach(b => { b.className = b.className.replace('border-green-600 bg-green-100', 'border-slate-300 bg-white'); });
@@ -298,7 +329,7 @@ async function salvarPagamento(id) {
       const novo = Math.round((v - resto) * 100) / 100;
       await db.from('fichas_compras').update({
         valor_compra: novo,
-        descricao_itens: fi.descricao_itens + ` (restante após pgto parcial de ${brl(resto)})`
+        descricao_itens: ((fi.descricao_itens || '') + ` (restante após pgto parcial de ${brl(resto)})`).trim()
       }).eq('id', fi.id);
       resto = 0;
     }
@@ -308,9 +339,9 @@ async function salvarPagamento(id) {
 
 function modalDetalhes(id) {
   const f = getF(id);
-  abrirModal(`${cabModal('📋 ' + esc(f.nome_familia))}
+  abrirModal(`${cabModal('📋 ' + esc(nomeF(f)))}
     ${f.fichas.length ? f.fichas.map(x => `<div class="border-b-2 py-2"><div class="text-sm text-slate-500">${fmtData(x.data_hora)}</div>
-      <div class="text-lg">${esc(x.descricao_itens)}</div><div class="text-xl font-black text-red-700">${brl(x.valor_compra)}</div></div>`).join('') +
+      <div class="text-lg">${esc(x.descricao_itens || 'Compra sem descrição')}</div><div class="text-xl font-black text-red-700">${brl(x.valor_compra)}</div></div>`).join('') +
       `<div class="text-center text-3xl font-black mt-4">TOTAL: ${brl(f.total)}</div>` :
       '<p class="text-xl text-center py-6 text-green-700 font-bold">Nenhuma compra pendente 🎉</p>'}
     <button class="btn bg-slate-200 w-full mt-4" onclick="fecharModal()">Fechar</button>`);
@@ -320,10 +351,10 @@ function modalNovoPedido() {
   abrirModal(`${cabModal('🛒 Novo Pedido Balcão')}
     <label class="${lbl}">Nome do cliente *</label>
     <input id="np_nome" list="np_lista" class="${inp}" placeholder="Digite ou escolha" autocomplete="off">
-    <datalist id="np_lista">${familias.map(f => `<option value="${esc(f.cliente_principal)} (${esc(f.nome_familia)})">`).join('')}</datalist>
+    <datalist id="np_lista">${familias.map(f => `<option value="${esc(f.cliente_principal && f.nome_familia ? f.cliente_principal + ' (' + f.nome_familia + ')' : nomeF(f))}">`).join('')}</datalist>
     <label class="${lbl}">Itens do pedido *</label>
     <textarea id="np_itens" rows="4" class="${inp}" placeholder="Ex: 2kg de picanha em bifes, 1kg de costela"></textarea>
-    <button class="btn bg-blue-700 text-white w-full mt-4 text-2xl" onclick="salvarPedido()">📤 ENVIAR PARA A BANCADA</button>`);
+    <button class="btn bg-blue-700 text-white w-full mt-4 text-2xl" onclick="seguro(salvarPedido)">📤 ENVIAR PARA A BANCADA</button>`);
 }
 async function salvarPedido() {
   const nome = $('#np_nome').value.trim(), itens = $('#np_itens').value.trim();
@@ -334,27 +365,30 @@ async function salvarPedido() {
 }
 
 // ---------- WhatsApp ----------
+const p2 = (n) => String(n).padStart(2, '0');
+const fmtDiaHora = (d) => { const x = new Date(d); return `${p2(x.getDate())}/${p2(x.getMonth() + 1)}, ${p2(x.getHours())}:${p2(x.getMinutes())}`; };
 function msgCobranca(f) {
-  const linhas = f.fichas.map(x => `• ${fmtData(x.data_hora)} - ${x.descricao_itens} - ${brl(x.valor_compra)}`).join('\n');
-  return `Olá, ${f.cliente_principal}! Aqui é do ${NOME_ACOUGUE}. 🥩\n\nSegue o extrato da sua ficha:\n${linhas}\n\n*TOTAL: ${brl(f.total)}*\n\nQuando puder, passe aqui para acertar. Obrigado pela preferência!`;
+  const linhas = f.fichas.map(x => `• ${fmtDiaHora(x.data_hora)} - ${x.descricao_itens ? x.descricao_itens + ' - ' : ''}${brl(x.valor_compra)}`).join('\n');
+  return (`Olá, ${nomeCli(f)}! Aqui é do ${NOME_ACOUGUE}. ☺️\n\nSegue o extrato da sua ficha:\n${linhas}\n\n*TOTAL: ${brl(f.total)}*\n\n` +
+    `Estamos a disposição, acerte por:\n- Pix, no conforto da sua casa;\nou\n- Passe aqui e pague em cartão ou dinheiro.\n\nObrigado pela preferência!`).replace(/ /g, ' ');
 }
 function enviarZap(id) {
   const f = getF(id);
   if (!f.telefone_whatsapp) return toast('Cliente sem telefone cadastrado', false);
-  const msg = f.total > 0 ? msgCobranca(f) : `Olá, ${f.cliente_principal}! Aqui é do ${NOME_ACOUGUE}. 🥩 Sua ficha está em dia. Obrigado pela preferência!`;
+  const msg = f.total > 0 ? msgCobranca(f) : `Olá, ${nomeCli(f)}! Aqui é do ${NOME_ACOUGUE}. ☺️ Sua ficha está em dia. Obrigado pela preferência!`;
   window.open(waLink(f.telefone_whatsapp, msg), '_blank');
 }
 
 // ---------- Impressão térmica (58mm) ----------
 function imprimirExtrato(id) {
   const f = getF(id);
-  const itens = f.fichas.length ? f.fichas.map(x => `<pre>${esc(fmtData(x.data_hora))}\n${esc(x.descricao_itens)}\n<b>${esc(brl(x.valor_compra))}</b></pre><pre>--------------------------------</pre>`).join('')
+  const itens = f.fichas.length ? f.fichas.map(x => `<pre>${esc(fmtData(x.data_hora))}\n${x.descricao_itens ? esc(x.descricao_itens) + '\n' : ''}<b>${esc(brl(x.valor_compra))}</b></pre><pre>--------------------------------</pre>`).join('')
     : '<pre>Nenhuma compra pendente.</pre>';
   $('#print-area').innerHTML = `
     <div class="c g">${esc(NOME_ACOUGUE)}</div>
     <pre class="c">EXTRATO DE FICHA</pre><pre>================================</pre>
-    <div class="g">${esc(f.nome_familia)}</div>
-    <pre>${esc(f.cliente_principal)}\n${esc(new Date().toLocaleString('pt-BR'))}</pre>
+    <div class="g">${esc(nomeF(f))}</div>
+    <pre>${f.cliente_principal && f.nome_familia ? esc(f.cliente_principal) + '\n' : ''}${esc(new Date().toLocaleString('pt-BR'))}</pre>
     <pre>================================</pre>${itens}
     <div class="box">TOTAL DEVIDO<br>${esc(brl(f.total))}</div>
     <pre class="c">Obrigado pela preferência!</pre><pre>\n\n</pre>`;
@@ -376,8 +410,8 @@ function renderInadimplencia() {
     <div class="grid gap-3">${devs.map((f, i) => `
       <article class="bg-white rounded-2xl shadow border-2 border-red-300 p-4">
         <div class="flex justify-between items-start gap-2">
-          <div><div class="text-sm text-slate-500">#${i + 1}</div><h2 class="text-2xl font-black">${esc(f.nome_familia)}</h2>
-          <p class="text-lg text-slate-600">${esc(f.cliente_principal)} ${f.telefone_whatsapp ? '· ' + esc(f.telefone_whatsapp) : ''}</p>
+          <div><div class="text-sm text-slate-500">#${i + 1}</div><h2 class="text-2xl font-black">${esc(nomeF(f))}</h2>
+          <p class="text-lg text-slate-600">${f.cliente_principal && f.nome_familia ? esc(f.cliente_principal) : ''} ${f.telefone_whatsapp ? '· ' + esc(f.telefone_whatsapp) : ''}</p>
           <p class="text-sm text-slate-500">Compra mais antiga: ${fmtData(f.fichas[0].data_hora)}</p></div>
           <div class="text-3xl font-black text-red-700 text-right">${brl(f.total)}</div></div>
         <div class="grid grid-cols-3 gap-2 mt-3">
@@ -388,6 +422,187 @@ function renderInadimplencia() {
       </article>`).join('') || '<p class="text-center text-2xl text-green-700 font-bold py-10">Ninguém devendo! 🎉</p>'}</div>
   </main>`;
 }
+// ============================================================
+// FINALIZAR EXPEDIENTE + DESTINATÁRIOS DO RELATÓRIO
+// ============================================================
+let relatorio = null;
+const dataLocal = (d = new Date()) => `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}`;
+const num2 = (n) => Math.round(Number(n || 0) * 100) / 100;
+
+function modalFinalizar() {
+  abrirModal(`${cabModal('🔒 Finalizar Expediente')}
+    <p class="text-xl">Vou gerar a <b>planilha geral do dia</b> (clientes, dívidas, pagamentos e pedidos) e enviar por <b>e-mail</b> para quem está cadastrado.</p>
+    <p class="text-lg text-slate-600 mt-2">Para <b>WhatsApp</b>, aparece um botão para mandar o resumo do dia e a planilha.</p>
+    <button class="btn bg-slate-800 text-white w-full mt-4 text-2xl" onclick="seguro(gerarRelatorio)">✅ GERAR E ENVIAR</button>
+    <button class="btn bg-slate-200 w-full mt-2" onclick="fecharModal()">Cancelar</button>`);
+}
+
+async function gerarRelatorio() {
+  if (typeof XLSX === 'undefined') throw new Error('A biblioteca de planilha não carregou. Verifique a internet e recarregue a página.');
+  toast('Gerando planilha...');
+  await carregarFamilias();
+  const hoje0 = new Date(); hoje0.setHours(0, 0, 0, 0);
+  const ini = hoje0.toISOString();
+  const [dest, pags, comprasHoje, pedidosHoje] = await Promise.all([
+    tudo('destinatarios_relatorio', '*'),
+    tudo('pagamentos_divida', '*'),
+    tudo('fichas_compras', '*', q => q.gte('data_hora', ini)),
+    tudo('pedidos_bancada', '*', q => q.gte('created_at', ini))
+  ]);
+  const nomes = new Map(familias.map(f => [Number(f.id), nomeF(f)]));
+  const nomeDe = (id) => nomes.get(Number(id)) || '(cliente removido)';
+  const soma = (arr, k) => num2(arr.reduce((s, x) => s + Number(x[k] || 0), 0));
+  const pagsHoje = pags.filter(p => new Date(p.data_hora) >= hoje0);
+  const clientes = [...familias].sort((a, b) => b.total - a.total || norm(nomeF(a)).localeCompare(norm(nomeF(b))));
+  const devedores = clientes.filter(f => f.total > 0);
+  const totalReceber = num2(devedores.reduce((s, f) => s + f.total, 0));
+  const recebidoHoje = soma(pagsHoje, 'valor_pago');
+  const compradoHoje = soma(comprasHoje, 'valor_compra');
+  const dia = new Date().toLocaleDateString('pt-BR');
+  const dh = (d) => new Date(d).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+  const hh = (d) => new Date(d).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+
+  const wb = XLSX.utils.book_new();
+  const aba = (nome, linhas, larguras, colsMoeda = []) => {
+    const ws = XLSX.utils.aoa_to_sheet(linhas);
+    ws['!cols'] = larguras.map(w => ({ wch: w }));
+    colsMoeda.forEach(c => {
+      for (let r = 1; r < linhas.length; r++) {
+        const cel = ws[XLSX.utils.encode_cell({ r, c })];
+        if (cel && typeof cel.v === 'number') cel.z = '"R$" #,##0.00';
+      }
+    });
+    XLSX.utils.book_append_sheet(wb, ws, nome);
+  };
+  aba('Resumo', [
+    [NOME_ACOUGUE], ['Fechamento do dia', dia], [],
+    ['Total a receber (todas as fichas)', brl(totalReceber)],
+    ['Clientes devendo', devedores.length],
+    ['Recebido hoje', brl(recebidoHoje)],
+    ['Compras anotadas na ficha hoje', brl(compradoHoje)],
+    ['Pedidos no balcão hoje', pedidosHoje.length]
+  ], [38, 24]);
+  aba('Clientes', [['Cliente / Família', 'Responsável', 'Telefone', 'Membros', 'Pedido habitual', 'Total devido'],
+    ...clientes.map(f => [nomeF(f), f.cliente_principal && f.nome_familia ? f.cliente_principal : '', f.telefone_whatsapp || '',
+      f.membros.map(m => m.nome_membro).join(', '), f.pedido_habitual || '', num2(f.total)])], [28, 22, 18, 30, 30, 16], [5]);
+  aba('Fichas pendentes', [['Cliente / Família', 'Data', 'Itens', 'Valor'],
+    ...devedores.flatMap(f => f.fichas.map(x => [nomeF(f), dh(x.data_hora), x.descricao_itens || '', num2(x.valor_compra)]))], [28, 18, 40, 14], [3]);
+  aba('Compras de hoje', [['Cliente / Família', 'Hora', 'Itens', 'Valor', 'Situação'],
+    ...comprasHoje.map(x => [nomeDe(x.familia_id), hh(x.data_hora), x.descricao_itens || '', num2(x.valor_compra), x.status])], [28, 10, 40, 14, 12], [3]);
+  aba('Pagamentos', [['Data', 'Cliente / Família', 'Forma', 'Valor'],
+    ...[...pags].sort((a, b) => new Date(b.data_hora) - new Date(a.data_hora)).map(p => [dh(p.data_hora), nomeDe(p.familia_id), p.forma_pagamento, num2(p.valor_pago)])], [18, 28, 12, 14], [3]);
+  aba('Pedidos de hoje', [['Hora', 'Cliente', 'Itens', 'Situação'],
+    ...pedidosHoje.map(p => [hh(p.created_at), p.cliente_nome, p.itens_pedido, p.status])], [10, 24, 44, 14]);
+
+  const arquivo = `fechamento-${dataLocal()}.xlsx`;
+  const base64 = XLSX.write(wb, { bookType: 'xlsx', type: 'base64' });
+  const bytes = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
+  const blob = new Blob([bytes], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+  const texto = [
+    `*${NOME_ACOUGUE}* - Fechamento de ${dia}`, '',
+    `💰 Total a receber: ${brl(totalReceber)}`,
+    `👥 Clientes devendo: ${devedores.length}`,
+    `✅ Recebido hoje: ${brl(recebidoHoje)}`,
+    `🧾 Compras na ficha hoje: ${brl(compradoHoje)}`,
+    `🛒 Pedidos no balcão hoje: ${pedidosHoje.length}`
+  ].join('\n').replace(/ /g, ' ');
+
+  const emails = dest.filter(d => d.tipo === 'email');
+  const zaps = dest.filter(d => d.tipo === 'whatsapp');
+  let emailStatus = null;
+  if (emails.length) {
+    try {
+      const { data, error } = await db.functions.invoke('enviar-relatorio', {
+        body: { assunto: `Fechamento ${dia} - ${NOME_ACOUGUE}`, arquivo, base64,
+          html: '<pre style="font-family:Arial,sans-serif;font-size:15px">' + esc(texto.replace(/\*/g, '')) + '</pre><p>Planilha completa em anexo.</p>' }
+      });
+      if (error) throw error;
+      if (data && data.erro === 'sem_chave') emailStatus = { ok: false, msg: 'O envio automático de e-mail ainda não foi ativado (falta a chave do serviço de e-mail). Use os botões abaixo por enquanto.' };
+      else if (data && data.erro) emailStatus = { ok: false, msg: 'Não consegui enviar o e-mail: ' + data.erro };
+      else emailStatus = { ok: true, msg: `E-mail enviado para ${emails.length} endereço(s) com a planilha em anexo.` };
+    } catch (e) {
+      emailStatus = { ok: false, msg: 'Não consegui enviar o e-mail automaticamente. Use os botões abaixo.' };
+    }
+  }
+  relatorio = { arquivo, blob, texto, emails, zaps, emailStatus, dia };
+  mostrarRelatorio();
+}
+
+function mostrarRelatorio() {
+  const r = relatorio;
+  const arq = new File([r.blob], r.arquivo, { type: r.blob.type });
+  const podeCompartilhar = !!(navigator.canShare && navigator.canShare({ files: [arq] }));
+  const mailto = 'mailto:' + r.emails.map(e => encodeURIComponent(e.contato)).join(',') +
+    '?subject=' + encodeURIComponent(`Fechamento ${r.dia} - ${NOME_ACOUGUE}`) + '&body=' + encodeURIComponent(r.texto.replace(/\*/g, '') + '\n\n(Anexe a planilha baixada.)');
+  abrirModal(`${cabModal('✅ Expediente finalizado')}
+    <p class="text-lg">Planilha pronta: <b>${esc(r.arquivo)}</b></p>
+    ${r.emailStatus
+      ? `<p class="mt-2 p-3 rounded-xl text-lg ${r.emailStatus.ok ? 'bg-green-100 text-green-800' : 'bg-amber-100 text-amber-900'}">📧 ${esc(r.emailStatus.msg)}</p>`
+      : '<p class="mt-2 text-slate-500">Nenhum e-mail cadastrado (botão 📬 Destinatários).</p>'}
+    <button class="btn bg-blue-700 text-white w-full mt-3" onclick="baixarPlanilha()">⬇️ Baixar planilha</button>
+    ${podeCompartilhar ? '<button class="btn bg-indigo-600 text-white w-full mt-2" onclick="compartilharPlanilha()">📤 Compartilhar planilha (WhatsApp, e-mail...)</button>' : ''}
+    ${r.zaps.map((z, i) => `<button class="btn bg-emerald-600 text-white w-full mt-2" onclick="enviarResumoZap(${i})">💬 Resumo no WhatsApp: ${esc(z.nome || z.contato)}</button>`).join('')}
+    ${r.zaps.length ? '<p class="text-sm text-slate-500 mt-1">O WhatsApp não permite enviar arquivo sozinho: o resumo abre pronto para enviar, e a planilha você anexa pelo botão Compartilhar (ou baixando e anexando).</p>'
+      : '<p class="text-sm text-slate-500 mt-2">Nenhum WhatsApp cadastrado (botão 📬 Destinatários).</p>'}
+    ${r.emails.length && !(r.emailStatus && r.emailStatus.ok) ? `<a class="btn bg-white border-2 border-slate-400 text-slate-800 w-full mt-2 flex items-center justify-center" href="${esc(mailto)}">✉️ Abrir e-mail com o resumo</a>` : ''}
+    <button class="btn bg-slate-200 w-full mt-3" onclick="fecharModal()">Fechar</button>`);
+}
+function baixarPlanilha() {
+  const url = URL.createObjectURL(relatorio.blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = relatorio.arquivo;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 4000);
+}
+async function compartilharPlanilha() {
+  const r = relatorio;
+  try { await navigator.share({ files: [new File([r.blob], r.arquivo, { type: r.blob.type })], title: r.arquivo, text: r.texto }); }
+  catch (e) { if (e.name !== 'AbortError') toast('Não foi possível compartilhar. Use "Baixar planilha".', false); }
+}
+function enviarResumoZap(i) {
+  window.open(waLink(relatorio.zaps[i].contato, relatorio.texto), '_blank');
+}
+
+async function modalDestinatarios() {
+  const dest = await tudo('destinatarios_relatorio', '*');
+  abrirModal(`${cabModal('📬 Destinatários do relatório')}
+    <p class="text-lg text-slate-600">Quem recebe o fechamento do dia.</p>
+    <div class="mt-2">${dest.length ? dest.map(d => `
+      <div class="flex items-center justify-between gap-2 border-b-2 py-2">
+        <div class="min-w-0"><div class="font-bold text-lg">${d.tipo === 'email' ? '📧' : '💬'} ${esc(d.nome || (d.tipo === 'email' ? 'E-mail' : 'WhatsApp'))}</div>
+        <div class="text-slate-600 break-all">${esc(d.contato)}</div></div>
+        <button class="btn bg-red-600 text-white" style="min-height:44px" onclick="removerDest(${d.id})">🗑️</button>
+      </div>`).join('') : '<p class="text-slate-500 py-3">Nenhum cadastrado ainda.</p>'}</div>
+    <h4 class="text-xl font-black mt-4">➕ Adicionar</h4>
+    <label class="${lbl}">Tipo</label>
+    <select id="ds_tipo" class="${inp}"><option value="whatsapp">WhatsApp</option><option value="email">E-mail</option></select>
+    <label class="${lbl}">Nome (opcional)</label><input id="ds_nome" class="${inp}" placeholder="Ex: Dono">
+    <label class="${lbl}">Número com DDD ou e-mail</label><input id="ds_contato" class="${inp}" placeholder="(75) 99999-9999 ou dono@gmail.com">
+    <button class="btn bg-green-600 text-white w-full mt-4 text-2xl" onclick="seguro(salvarDest)">✅ ADICIONAR</button>
+    <button class="btn bg-slate-200 w-full mt-2" onclick="fecharModal()">Fechar</button>`);
+}
+async function salvarDest() {
+  const tipo = $('#ds_tipo').value, nome = $('#ds_nome').value.trim();
+  let contato = $('#ds_contato').value.trim();
+  if (tipo === 'email') {
+    contato = contato.toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(contato)) return toast('E-mail inválido', false);
+  } else {
+    contato = telDigits(contato);
+    if (contato.length < 10) return toast('Número inválido (coloque o DDD)', false);
+  }
+  const { error } = await db.from('destinatarios_relatorio').insert({ tipo, nome: nome || null, contato });
+  if (error) return toast('Erro: ' + error.message, false);
+  toast('Cadastrado!');
+  await modalDestinatarios();
+}
+async function removerDest(id) {
+  if (!confirm('Remover este destinatário?')) return;
+  const { error } = await db.from('destinatarios_relatorio').delete().eq('id', id);
+  if (error) return toast('Erro: ' + error.message, false);
+  await modalDestinatarios();
+}
+
 let filaCobranca = [];
 function cobrancaEmMassa() {
   filaCobranca = familias.filter(f => f.total > 0 && f.telefone_whatsapp).sort((a, b) => b.total - a.total);
@@ -398,7 +613,7 @@ function proximaCobranca() {
   const f = filaCobranca.shift();
   if (!f) { fecharModal(); return toast('Cobranças enviadas!'); }
   abrirModal(`${cabModal('💬 Cobrança em massa')}
-    <p class="text-xl">Próximo: <b>${esc(f.nome_familia)}</b> — <span class="text-red-700 font-black">${brl(f.total)}</span></p>
+    <p class="text-xl">Próximo: <b>${esc(nomeF(f))}</b> — <span class="text-red-700 font-black">${brl(f.total)}</span></p>
     <p class="text-slate-500 mb-3">Restam ${filaCobranca.length} depois deste.</p>
     <button class="btn bg-emerald-600 text-white w-full text-xl" onclick="window.open(waLink(getF(${f.id}).telefone_whatsapp, msgCobranca(getF(${f.id}))),'_blank');proximaCobranca()">💬 Abrir WhatsApp e ir para o próximo</button>
     <button class="btn bg-slate-200 w-full mt-2" onclick="proximaCobranca()">Pular</button>`);
