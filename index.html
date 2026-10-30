@@ -42,7 +42,7 @@
 const SUPABASE_URL = 'https://ahpfjuqggtqumntrxvhd.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFocGZqdXFnZ3RxdW1udHJ4dmhkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTMzMTM5NjAsImV4cCI6MjEwODg4OTk2MH0.VW4apHPRFvSygdEBBFxCLGXhK0j92n3hI22GreehEv8';  // chave pública (segura para o site)
 const NOME_ACOUGUE = 'FRIGORÍFICO RODRIGUES';                   // aparece no extrato e no zap
-const MINUTOS_CONCLUIDO_NA_TV = 5;                      // pedido concluído some da TV após X min
+const DIAS_PRAZO = 30;                                  // a cobrança vence X dias após a primeira compra em aberto
 
 /* ============================================================ */
 const configurado = !SUPABASE_URL.startsWith('COLE') && !SUPABASE_ANON_KEY.startsWith('COLE');
@@ -157,7 +157,9 @@ async function render() {
   try {
     if (r === '/tv') return await renderTV();
     await carregarFamilias();
-    if (r === '/inadimplencia') renderInadimplencia(); else renderInicio();
+    if (r === '/inadimplencia') renderInadimplencia();
+    else if (r === '/acougueiros') await renderAcougueiros();
+    else renderInicio();
   } catch (e) {
     $('#app').innerHTML = `<div class="p-6 max-w-xl mx-auto"><div class="bg-red-100 border-2 border-red-500 rounded-2xl p-6 text-xl">
       <p class="font-black text-2xl mb-2">⚠️ Erro ao conectar</p><p>${esc(e.message || e)}</p>
@@ -179,6 +181,7 @@ function navbar(ativo) {
   return `<nav class="flex gap-2 p-2 sticky top-0 z-30 bg-slate-100">
     ${item('#/', '🔎', 'Clientes', 'inicio')}
     ${item('#/inadimplencia', '💰', 'Devedores', 'inad')}
+    ${item('#/acougueiros', '🔪', 'Açougueiros', 'acoug')}
     ${item('#/tv', '📺', 'TV', 'tv')}</nav>`;
 }
 
@@ -224,6 +227,7 @@ function cardFamilia(f) {
     <div class="mt-3 rounded-xl p-3 text-center ${f.total > 0 ? 'bg-red-600 text-white' : 'bg-green-100 text-green-800'}">
       <div class="text-base font-bold">${f.total > 0 ? 'TOTAL DEVIDO' : 'SEM DÍVIDA'}</div>
       <div class="text-4xl font-black">${brl(f.total)}</div>
+      ${f.total > 0 ? `<div class="text-base font-bold mt-1">📅 ${esc(textoPrazo(f))}</div>` : ''}
     </div>
     <div class="grid grid-cols-2 gap-2 mt-3">
       <button class="btn bg-orange-500 text-white" onclick="modalCompra(${f.id})">🧾 Registrar Compra</button>
@@ -239,6 +243,13 @@ function cardFamilia(f) {
 function abrirModal(html) {
   $('#modal-root').innerHTML = `<div class="fixed inset-0 z-50 bg-black/60 flex items-end sm:items-center justify-center p-0 sm:p-4" onclick="if(event.target===this)fecharModal()">
     <div class="bg-white w-full sm:max-w-lg max-h-[95vh] overflow-y-auto rounded-t-3xl sm:rounded-3xl p-5 shadow-2xl">${html}</div></div>`;
+  semSugestoes();
+}
+// O navegador guarda tudo que é digitado e mostra uma lista enorme: desliga isso
+function semSugestoes() {
+  document.querySelectorAll('#modal-root input, #modal-root textarea').forEach(el => {
+    if (el.type !== 'password') { el.setAttribute('autocomplete', 'off'); el.setAttribute('autocorrect', 'off'); el.name = 'x' + Math.random().toString(36).slice(2); }
+  });
 }
 function fecharModal() { $('#modal-root').innerHTML = ''; }
 const lbl = 'block text-xl font-bold mt-3 mb-1';
@@ -347,19 +358,61 @@ function modalDetalhes(id) {
     <button class="btn bg-slate-200 w-full mt-4" onclick="fecharModal()">Fechar</button>`);
 }
 
-function modalNovoPedido() {
+let acougueiros = [];
+async function carregarAcougueiros() {
+  const { data, error } = await db.from('acougueiros').select('*').order('nome');
+  if (error) throw new Error('Falta criar a lista de açougueiros no banco: rode o arquivo atualizacao-acougueiros.sql no Supabase (SQL Editor).');
+  acougueiros = data;
+}
+async function renderAcougueiros() {
+  await carregarAcougueiros();
+  $('#app').innerHTML = `${navbar('acoug')}
+  <main class="px-3 pb-24 max-w-xl mx-auto">
+    <div class="bg-white rounded-2xl shadow p-4">
+      <h1 class="text-2xl font-black mb-2">🔪 Açougueiros</h1>
+      <p class="text-lg text-slate-600">Quem aparece para escolher no pedido.</p>
+      <div class="flex gap-2 mt-3"><input id="ac_nome" class="${inp}" placeholder="Nome do açougueiro" autocomplete="off" onkeydown="if(event.key==='Enter')seguro(salvarAcougueiro)">
+      <button class="btn bg-green-600 text-white" onclick="seguro(salvarAcougueiro)">➕</button></div>
+      <div class="mt-3">${acougueiros.map(a => `<div class="flex items-center justify-between border-b-2 py-3">
+        <span class="text-2xl font-bold">${esc(a.nome)}</span>
+        <button class="btn bg-red-600 text-white" style="min-height:44px" onclick="seguro(()=>removerAcougueiro(${a.id}))">🗑️</button></div>`).join('') || '<p class="text-slate-500 py-3">Nenhum cadastrado ainda.</p>'}</div>
+    </div></main>`;
+}
+async function salvarAcougueiro() {
+  const nome = $('#ac_nome').value.trim();
+  if (!nome) return toast('Digite o nome', false);
+  const { error } = await db.from('acougueiros').insert({ nome });
+  if (error) return toast('Erro: ' + error.message, false);
+  toast('Açougueiro cadastrado!'); await renderAcougueiros(); $('#ac_nome').focus();
+}
+async function removerAcougueiro(id) {
+  if (!confirm('Remover este açougueiro?')) return;
+  const { error } = await db.from('acougueiros').delete().eq('id', id);
+  if (error) return toast('Erro: ' + error.message, false);
+  await renderAcougueiros();
+}
+
+async function modalNovoPedido() {
+  try { await carregarAcougueiros(); } catch (e) { acougueiros = []; }
   abrirModal(`${cabModal('🛒 Novo Pedido Balcão')}
     <label class="${lbl}">Nome do cliente *</label>
     <input id="np_nome" list="np_lista" class="${inp}" placeholder="Digite ou escolha" autocomplete="off">
     <datalist id="np_lista">${familias.map(f => `<option value="${esc(f.cliente_principal && f.nome_familia ? f.cliente_principal + ' (' + f.nome_familia + ')' : nomeF(f))}">`).join('')}</datalist>
     <label class="${lbl}">Itens do pedido *</label>
     <textarea id="np_itens" rows="4" class="${inp}" placeholder="Ex: 2kg de picanha em bifes, 1kg de costela"></textarea>
+    <label class="${lbl}">Quem vai fazer?</label>
+    ${acougueiros.length ? `<div class="grid grid-cols-2 gap-2" id="np_acoug">${acougueiros.map(a => `<button type="button" data-v="${esc(a.nome)}" class="btn border-4 border-slate-300 bg-white" onclick="document.querySelectorAll('#np_acoug button').forEach(b=>b.classList.remove('border-blue-700','bg-blue-100'));this.classList.add('border-blue-700','bg-blue-100')">🔪 ${esc(a.nome)}</button>`).join('')}</div>`
+      : '<p class="text-base text-slate-500">Cadastre os açougueiros na aba 🔪 Açougueiros.</p>'}
     <button class="btn bg-blue-700 text-white w-full mt-4 text-2xl" onclick="seguro(salvarPedido)">📤 ENVIAR PARA A BANCADA</button>`);
 }
 async function salvarPedido() {
   const nome = $('#np_nome').value.trim(), itens = $('#np_itens').value.trim();
   if (!nome || !itens) return toast('Preencha o nome e os itens', false);
-  const { error } = await db.from('pedidos_bancada').insert({ cliente_nome: nome, itens_pedido: itens, status: 'Pendente' });
+  const acoug = document.querySelector('#np_acoug .border-blue-700')?.dataset.v || null;
+  if (acougueiros.length && !acoug) return toast('Escolha quem vai fazer o pedido', false);
+  const novo = { cliente_nome: nome, itens_pedido: itens, status: 'Pendente' };
+  if (acoug) novo.acougueiro = acoug;
+  const { error } = await db.from('pedidos_bancada').insert(novo);
   if (error) return toast('Erro: ' + error.message, false);
   fecharModal(); toast('Pedido enviado para a TV da bancada!');
 }
@@ -367,9 +420,33 @@ async function salvarPedido() {
 // ---------- WhatsApp ----------
 const p2 = (n) => String(n).padStart(2, '0');
 const fmtDiaHora = (d) => { const x = new Date(d); return `${p2(x.getDate())}/${p2(x.getMonth() + 1)}, ${p2(x.getHours())}:${p2(x.getMinutes())}`; };
+const DIA_MS = 86400000;
+const fmtDia = (d) => new Date(d).toLocaleDateString('pt-BR');
+// Vencimento = data da compra mais antiga em aberto + DIAS_PRAZO
+function vencimento(f) {
+  if (!f.fichas || !f.fichas.length) return null;
+  const v = new Date(f.fichas[0].data_hora); v.setHours(0, 0, 0, 0);
+  return new Date(v.getTime() + DIAS_PRAZO * DIA_MS);
+}
+function diasParaVencer(f) {            // negativo = atrasado
+  const v = vencimento(f); if (!v) return null;
+  const h = new Date(); h.setHours(0, 0, 0, 0);
+  return Math.round((v - h) / DIA_MS);
+}
+const vencido = (f) => f.total > 0 && diasParaVencer(f) <= 0;
+function textoPrazo(f) {
+  const d = diasParaVencer(f);
+  if (d === null) return '';
+  if (d > 0) return `vence em ${fmtDia(vencimento(f))} (faltam ${d} dia${d > 1 ? 's' : ''})`;
+  if (d === 0) return `vence HOJE (${fmtDia(vencimento(f))})`;
+  return `venceu em ${fmtDia(vencimento(f))} (${-d} dia${d < -1 ? 's' : ''} de atraso)`;
+}
 function msgCobranca(f) {
   const linhas = f.fichas.map(x => `• ${fmtDiaHora(x.data_hora)} - ${x.descricao_itens ? x.descricao_itens + ' - ' : ''}${brl(x.valor_compra)}`).join('\n');
-  return (`Olá, ${nomeCli(f)}! Aqui é do ${NOME_ACOUGUE}. ☺️\n\nSegue o extrato da sua ficha:\n${linhas}\n\n*TOTAL: ${brl(f.total)}*\n\n` +
+  const d = diasParaVencer(f);
+  const prazo = d > 0 ? `📅 Vencimento: *${fmtDia(vencimento(f))}* (${DIAS_PRAZO} dias após a primeira compra)`
+    : `📅 Venceu em: *${fmtDia(vencimento(f))}*${d < 0 ? ` (${-d} dia${d < -1 ? 's' : ''} de atraso)` : ' (hoje)'}`;
+  return (`Olá, ${nomeCli(f)}! Aqui é do ${NOME_ACOUGUE}. ☺️\n\nSegue o histórico das suas compras na ficha (${f.fichas.length} compra${f.fichas.length > 1 ? 's' : ''}):\n${linhas}\n\n*TOTAL: ${brl(f.total)}*\n${prazo}\n\n` +
     `Estamos a disposição, acerte por:\n- Pix, no conforto da sua casa;\nou\n- Passe aqui e pague em cartão ou dinheiro.\n\nObrigado pela preferência!`).replace(/ /g, ' ');
 }
 function enviarZap(id) {
@@ -398,29 +475,62 @@ function imprimirExtrato(id) {
 // ============================================================
 // TELA 3 — Inadimplência
 // ============================================================
+function cardDevedor(f) {
+  const atras = vencido(f);
+  return `<article class="bg-white rounded-2xl shadow border-2 ${atras ? 'border-red-500' : 'border-amber-300'} p-4">
+    <div class="flex justify-between items-start gap-2">
+      <div><h2 class="text-2xl font-black">${esc(nomeF(f))}</h2>
+      <p class="text-lg text-slate-600">${f.cliente_principal && f.nome_familia ? esc(f.cliente_principal) : ''} ${f.telefone_whatsapp ? '· ' + esc(f.telefone_whatsapp) : '· <b class="text-red-600">sem telefone</b>'}</p>
+      <p class="text-base font-bold ${atras ? 'text-red-700' : 'text-amber-700'}">📅 ${esc(textoPrazo(f))}</p>
+      <p class="text-sm text-slate-500">${f.fichas.length} compra(s) · primeira em ${fmtData(f.fichas[0].data_hora)}</p></div>
+      <div class="text-3xl font-black text-red-700 text-right">${brl(f.total)}</div></div>
+    <div class="grid grid-cols-3 gap-2 mt-3">
+      ${f.telefone_whatsapp ? `<a class="btn bg-blue-600 text-white text-center flex items-center justify-center" href="tel:${telDigits(f.telefone_whatsapp)}">📞 Ligar</a>` : '<span class="btn bg-slate-200 text-slate-400 text-center flex items-center justify-center">📞</span>'}
+      <button class="btn bg-emerald-500 text-white" onclick="enviarZap(${f.id})">💬 Zap</button>
+      <button class="btn bg-green-700 text-white" onclick="modalPagamento(${f.id})">💵 Pagou</button>
+    </div>
+    <button class="w-full mt-2 text-slate-500 underline text-base py-2" onclick="modalDetalhes(${f.id})">Ver histórico de compras</button>
+  </article>`;
+}
 function renderInadimplencia() {
-  const devs = familias.filter(f => f.total > 0).sort((a, b) => b.total - a.total);
-  const soma = devs.reduce((s, f) => s + f.total, 0);
+  const devs = familias.filter(f => f.total > 0).sort((a, b) => diasParaVencer(a) - diasParaVencer(b) || b.total - a.total);
+  const venc = devs.filter(vencido), prazo = devs.filter(f => !vencido(f));
+  const soma = (l) => l.reduce((s, f) => s + f.total, 0);
   $('#app').innerHTML = `${navbar('inad')}
   <main class="px-3 pb-24 max-w-3xl mx-auto">
-    <div class="bg-red-700 text-white rounded-2xl p-4 text-center mb-3">
-      <div class="text-lg font-bold">${devs.length} família(s) devendo</div>
-      <div class="text-5xl font-black">${brl(soma)}</div></div>
-    ${devs.length ? `<button class="btn bg-emerald-600 text-white w-full mb-3" onclick="cobrancaEmMassa()">💬 Cobrar todos pelo WhatsApp (um por vez)</button>` : ''}
-    <div class="grid gap-3">${devs.map((f, i) => `
-      <article class="bg-white rounded-2xl shadow border-2 border-red-300 p-4">
-        <div class="flex justify-between items-start gap-2">
-          <div><div class="text-sm text-slate-500">#${i + 1}</div><h2 class="text-2xl font-black">${esc(nomeF(f))}</h2>
-          <p class="text-lg text-slate-600">${f.cliente_principal && f.nome_familia ? esc(f.cliente_principal) : ''} ${f.telefone_whatsapp ? '· ' + esc(f.telefone_whatsapp) : ''}</p>
-          <p class="text-sm text-slate-500">Compra mais antiga: ${fmtData(f.fichas[0].data_hora)}</p></div>
-          <div class="text-3xl font-black text-red-700 text-right">${brl(f.total)}</div></div>
-        <div class="grid grid-cols-3 gap-2 mt-3">
-          ${f.telefone_whatsapp ? `<a class="btn bg-blue-600 text-white text-center flex items-center justify-center" href="tel:${telDigits(f.telefone_whatsapp)}">📞 Ligar</a>` : '<span class="btn bg-slate-200 text-slate-400 text-center flex items-center justify-center">📞</span>'}
-          <button class="btn bg-emerald-500 text-white" onclick="enviarZap(${f.id})">💬 Zap</button>
-          <button class="btn bg-green-700 text-white" onclick="modalPagamento(${f.id})">💵 Pagou</button>
-        </div>
-      </article>`).join('') || '<p class="text-center text-2xl text-green-700 font-bold py-10">Ninguém devendo! 🎉</p>'}</div>
+    <div class="grid grid-cols-2 gap-2 mb-3">
+      <div class="bg-red-700 text-white rounded-2xl p-4 text-center"><div class="text-lg font-bold">🔴 COBRAR AGORA (${venc.length})</div>
+        <div class="text-3xl font-black">${brl(soma(venc))}</div><div class="text-sm">passaram de ${DIAS_PRAZO} dias</div></div>
+      <div class="bg-amber-400 text-black rounded-2xl p-4 text-center"><div class="text-lg font-bold">🟡 NO PRAZO (${prazo.length})</div>
+        <div class="text-3xl font-black">${brl(soma(prazo))}</div><div class="text-sm">ainda não venceu</div></div>
+    </div>
+    ${venc.length ? `<button class="btn bg-emerald-600 text-white w-full mb-2" onclick="cobrancaEmMassa()">💬 Cobrar os vencidos pelo WhatsApp (um por vez)</button>
+    <button class="btn bg-blue-700 text-white w-full mb-3" onclick="planilhaCobranca()">📊 Baixar planilha de cobrança (número + mensagem) para robô</button>` : ''}
+    <h2 class="text-2xl font-black text-red-700 mt-2 mb-2">🔴 Cobrar agora</h2>
+    <div class="grid gap-3">${venc.map(cardDevedor).join('') || '<p class="text-center text-xl text-green-700 font-bold py-4">Ninguém com dívida vencida 🎉</p>'}</div>
+    ${prazo.length ? `<h2 class="text-2xl font-black text-amber-700 mt-6 mb-2">🟡 No prazo (não cobrar ainda)</h2>
+    <div class="grid gap-3">${prazo.map(cardDevedor).join('')}</div>` : ''}
   </main>`;
+}
+function telInternacional(t) {
+  let d = telDigits(t);
+  if (!d) return '';
+  if (!d.startsWith('55') || d.length <= 11) d = '55' + d.replace(/^55/, '');
+  return d;
+}
+function planilhaCobranca() {
+  if (typeof XLSX === 'undefined') return toast('A biblioteca de planilha não carregou. Recarregue a página.', false);
+  const lista = familias.filter(f => vencido(f) && f.telefone_whatsapp).sort((a, b) => b.total - a.total);
+  if (!lista.length) return toast('Nenhum devedor vencido com telefone', false);
+  const linhas = [['Nome', 'Telefone', 'Mensagem', 'Valor', 'Vencimento', 'Dias de atraso'],
+    ...lista.map(f => [nomeCli(f), telInternacional(f.telefone_whatsapp), msgCobranca(f).replace(/\u00a0/g, ' '), Math.round(f.total * 100) / 100, fmtDia(vencimento(f)), -diasParaVencer(f)])];
+  const ws = XLSX.utils.aoa_to_sheet(linhas);
+  ws['!cols'] = [{ wch: 24 }, { wch: 16 }, { wch: 80 }, { wch: 12 }, { wch: 12 }, { wch: 10 }];
+  for (let r = 1; r < linhas.length; r++) { const c = ws[XLSX.utils.encode_cell({ r, c: 1 })]; if (c) { c.t = 's'; c.v = String(c.v); } }
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Cobranca');
+  XLSX.writeFile(wb, `cobranca-${dataLocal()}.xlsx`);
+  toast(`Planilha com ${lista.length} cobrança(s) baixada!`);
 }
 // ============================================================
 // FINALIZAR EXPEDIENTE + DESTINATÁRIOS DO RELATÓRIO
@@ -485,14 +595,14 @@ async function gerarRelatorio() {
   aba('Clientes', [['Cliente / Família', 'Responsável', 'Telefone', 'Membros', 'Pedido habitual', 'Total devido'],
     ...clientes.map(f => [nomeF(f), f.cliente_principal && f.nome_familia ? f.cliente_principal : '', f.telefone_whatsapp || '',
       f.membros.map(m => m.nome_membro).join(', '), f.pedido_habitual || '', num2(f.total)])], [28, 22, 18, 30, 30, 16], [5]);
-  aba('Fichas pendentes', [['Cliente / Família', 'Data', 'Itens', 'Valor'],
-    ...devedores.flatMap(f => f.fichas.map(x => [nomeF(f), dh(x.data_hora), x.descricao_itens || '', num2(x.valor_compra)]))], [28, 18, 40, 14], [3]);
+  aba('Fichas pendentes', [['Cliente / Família', 'Data', 'Itens', 'Valor', 'Vencimento da ficha'],
+    ...devedores.flatMap(f => f.fichas.map(x => [nomeF(f), dh(x.data_hora), x.descricao_itens || '', num2(x.valor_compra), fmtDia(vencimento(f))]))], [28, 18, 40, 14, 16], [3]);
   aba('Compras de hoje', [['Cliente / Família', 'Hora', 'Itens', 'Valor', 'Situação'],
     ...comprasHoje.map(x => [nomeDe(x.familia_id), hh(x.data_hora), x.descricao_itens || '', num2(x.valor_compra), x.status])], [28, 10, 40, 14, 12], [3]);
   aba('Pagamentos', [['Data', 'Cliente / Família', 'Forma', 'Valor'],
     ...[...pags].sort((a, b) => new Date(b.data_hora) - new Date(a.data_hora)).map(p => [dh(p.data_hora), nomeDe(p.familia_id), p.forma_pagamento, num2(p.valor_pago)])], [18, 28, 12, 14], [3]);
-  aba('Pedidos de hoje', [['Hora', 'Cliente', 'Itens', 'Situação'],
-    ...pedidosHoje.map(p => [hh(p.created_at), p.cliente_nome, p.itens_pedido, p.status])], [10, 24, 44, 14]);
+  aba('Pedidos de hoje', [['Hora', 'Cliente', 'Itens', 'Açougueiro', 'Situação'],
+    ...pedidosHoje.map(p => [hh(p.created_at), p.cliente_nome, p.itens_pedido, p.acougueiro || '', p.status === 'Concluído' ? 'Entregue' : 'Na TV'])], [10, 24, 44, 18, 14]);
 
   const arquivo = `fechamento-${dataLocal()}.xlsx`;
   const base64 = XLSX.write(wb, { bookType: 'xlsx', type: 'base64' });
@@ -605,8 +715,8 @@ async function removerDest(id) {
 
 let filaCobranca = [];
 function cobrancaEmMassa() {
-  filaCobranca = familias.filter(f => f.total > 0 && f.telefone_whatsapp).sort((a, b) => b.total - a.total);
-  if (!filaCobranca.length) return toast('Nenhum devedor com telefone', false);
+  filaCobranca = familias.filter(f => vencido(f) && f.telefone_whatsapp).sort((a, b) => b.total - a.total);
+  if (!filaCobranca.length) return toast('Nenhum devedor vencido com telefone', false);
   proximaCobranca();
 }
 function proximaCobranca() {
@@ -634,7 +744,7 @@ async function renderTV() {
         <div class="flex items-center gap-4"><span id="tv-hora" class="text-5xl font-black"></span>
         <a href="#/" class="btn bg-slate-700 text-white text-lg">⬅ Sair</a></div>
       </header>
-      <div id="tv-grid" class="grid gap-4 grid-cols-1 xl:grid-cols-3"></div>
+      <div id="tv-grid" class="grid gap-4 grid-cols-1 md:grid-cols-2 xl:grid-cols-3"></div>
     </div>`;
   await carregarTV(true);
   const relogio = () => { const el = $('#tv-hora'); if (el) el.textContent = new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }); drawTV(); };
@@ -660,30 +770,19 @@ function bipe() {
 }
 function drawTV(novosIds = new Set(), primeira = false) {
   const grid = $('#tv-grid'); if (!grid) return;
-  const limite = Date.now() - MINUTOS_CONCLUIDO_NA_TV * 60000;
-  const cols = [
-    ['Pendente', '⏳ PENDENTE', 'border-red-500', 'text-red-400'],
-    ['Em Preparo', '🔪 EM PREPARO', 'border-yellow-400', 'text-yellow-300'],
-    ['Concluído', '✅ PRONTO', 'border-green-500', 'text-green-400']
-  ];
-  grid.innerHTML = cols.map(([st, titulo, borda, cor]) => {
-    const itens = pedidosTV.filter(p => p.status === st && (st !== 'Concluído' || new Date(p.created_at).getTime() > limite || (p._conc || 0) > limite));
-    return `<section class="bg-slate-900 rounded-3xl border-4 ${borda} p-3 min-h-[40vh]">
-      <h2 class="text-4xl font-black ${cor} mb-3">${titulo} <span class="opacity-70">(${itens.length})</span></h2>
-      <div class="space-y-3">${itens.map(p => `
-        <div class="bg-slate-800 rounded-2xl p-4 ${novosIds.has(p.id) && !primeira ? 'novo' : ''}">
-          <div class="flex justify-between items-baseline"><span class="text-4xl font-black">${esc(p.cliente_nome)}</span><span class="text-2xl text-slate-400">${fmtHora(p.created_at)}</span></div>
-          <p class="text-3xl mt-2 whitespace-pre-line leading-snug">${esc(p.itens_pedido)}</p>
-          ${st !== 'Concluído' ? `<button class="btn w-full mt-3 text-3xl ${st === 'Pendente' ? 'bg-yellow-500 text-black' : 'bg-green-600 text-white'}" onclick="avancarPedido(${p.id},'${st}')">${st === 'Pendente' ? 'Começar preparo ▶' : 'Concluir ✔'}</button>` : ''}
-        </div>`).join('') || '<p class="text-2xl text-slate-600 text-center py-8">—</p>'}</div></section>`;
-  }).join('');
+  const fila = pedidosTV.filter(p => p.status !== 'Concluído');
+  grid.innerHTML = fila.map(p => `
+    <div class="bg-slate-800 rounded-3xl border-4 border-yellow-400 p-4 ${novosIds.has(p.id) && !primeira ? 'novo' : ''}">
+      <div class="flex justify-between items-baseline gap-2"><span class="text-4xl font-black">${esc(p.cliente_nome)}</span><span class="text-2xl text-slate-400">${fmtHora(p.created_at)}</span></div>
+      ${p.acougueiro ? `<p class="text-2xl font-bold text-yellow-300 mt-1">🔪 ${esc(p.acougueiro)}</p>` : ''}
+      <p class="text-3xl mt-2 whitespace-pre-line leading-snug">${esc(p.itens_pedido)}</p>
+      <button class="btn w-full mt-3 text-3xl bg-green-600 text-white" onclick="darBaixa(${p.id})">✔ Entregue (dar baixa)</button>
+    </div>`).join('') || '<p class="col-span-full text-4xl text-slate-600 text-center py-20">Nenhum pedido no momento</p>';
 }
-async function avancarPedido(id, atual) {
-  const prox = atual === 'Pendente' ? 'Em Preparo' : 'Concluído';
-  const p = pedidosTV.find(x => x.id === id);
-  if (p) { p.status = prox; if (prox === 'Concluído') p._conc = Date.now(); drawTV(); }
-  const { error } = await db.from('pedidos_bancada').update({ status: prox }).eq('id', id);
-  if (error) toast('Erro: ' + error.message, false);
+async function darBaixa(id) {
+  pedidosTV = pedidosTV.filter(x => x.id !== id); drawTV();
+  const { error } = await db.from('pedidos_bancada').update({ status: 'Concluído' }).eq('id', id);
+  if (error) { toast('Erro: ' + error.message, false); carregarTV(false); }
 }
 
 // Restaura o fundo claro ao sair da TV
